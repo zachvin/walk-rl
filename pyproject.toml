@@ -1,0 +1,17 @@
+[project]
+name = "walk-rl"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "Zach",email = "zachtvin@gmail.com"}
+]
+requires-python = ">=3.13 <3.15"
+dependencies = [
+    "gymnasium[mujoco] (>=1.3.0,<2.0.0)",
+    "torch (>=2.11.0,<3.0.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
