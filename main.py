@@ -3,7 +3,8 @@ import torch
 import torch.functional as F
 import numpy as np
 import gymnasium as gym
-import copy
+from collections import deque
+from dataclasses import dataclass
 
 class PPOAgent():
     # has network and device
@@ -94,10 +95,107 @@ class DDPGActor(nn.Module):
 class D4PGActor(DDPGActor):
     pass
 
+@dataclass
+class Experience:
+    state: np.ndarray
+    action: np.ndarray
+    reward: float
+    done: bool
+
+class ExperienceSource():
+    def __init__(self, env, agent, steps_count:int = 5, steps_delta:int = 1):
+        self.env = env
+        self.steps_count = steps_count # number of steps per memory
+        self.agent = agent
+        self.steps_delta = steps_delta # number of steps between start states
+                                       # of memories
+        self.total_rews = []
+        self.total_steps = []
+
+    def __iter__(self):
+        # make environment
+        obs, _ = env.reset()
+
+        history = deque(maxlen=self.steps_count)
+        cur_rews = 0.0
+        cur_steps = 0
+        
+        iters = 0
+        while True:
+            actions = self.agent(obs)
+            obs, rew, term, trunc, _ = env.step(actions)
+
+            cur_rews += rew
+            cur_steps += 1
+
+            # if buffer is full enough and it's time to send back obs, yield
+            # if env is done, incrementally yield last few until it's empty
+
+            history.append(Experience(state=obs, action=actions, reward=rew,
+                                      done=term or trunc))
+            if len(history) == self.steps_count \
+               and iters % self.steps_delta == 0:
+                yield tuple(history)
+
+            if term or trunc:
+                if 0 < len(history) < self.steps_count:
+                    yield tuple(history)
+                while len(history) > 1:
+                    history.popleft()
+                    yield tuple(history)
+
+                # metrics
+                self.total_rews.append(cur_rews)
+                self.total_steps.append(cur_steps)
+
+                cur_rews = 0.0
+                cur_steps = 0
+
+                obs, _ = env.reset()
+                history.clear()
+
+            iters += 1
+
+@dataclass
+class ExperienceFL:
+    state: np.ndarray
+    action: np.ndarray
+    reward: float
+    final: np.ndarray
+
+class ExperienceSourceFL():
+    def __init__(self, env, agent, steps_count, steps_delta, gamma):
+        super(ExperienceSourceFL, self).__init__(env, agent, steps_count+1,
+                                                 steps_delta)
+        self.gamma = gamma # reward discount
+        self.steps = steps_count
+
+    def __iter__(self):
+        for mem in super(ExperienceSourceFL, self).__iter__():
+            # if memory is terminal, set last state to none and calculate
+            # reward based on all states
+            if mem[-1].done and len(mem) <= self.steps:
+                last_state = None
+                items = mem
+
+            # otherwise, calculate reward based on all but last state
+            # and last state is returned to be used for bootstrapping
+            else:
+                last_state = mem[-1]
+                items = mem[:-1]
+
+            # calculate discounted reward backward
+            discounted_reward = 0.0
+            for m in reversed(items):
+                discounted_reward *= self.gamma
+                discounted_reward += m.reward
+
+            yield ExperienceFL(state=mem[0], action=action, reward=discounted_reward, final=last_state)
+
 
 
 if __name__ == "__main__":
-    GAMMA = 0.99
+    GAMMA = 0.99 # reward discounting
     BATCH_SIZE = 64
     LEARNING_RATE = 1e-4
     REPLAY_SIZE = 100000
@@ -127,12 +225,27 @@ if __name__ == "__main__":
 
         ep_rews = []
 
+        steps = 0
+        reward_group = []
         while not term or trunc:
             action = env.action_space.sample()
 
             obs, rew, term, trunc, _ = env.step(action)
 
             ep_rews.append(rew)
+
+            reward_group.append([obs, rew, term or trunc])
+            if steps % REWARD_STEPS == 0:
+                # work backwards to get rewards
+                discounted_reward = 0
+                done_states = []
+                for i,item in enumerate(reversed(reward_group)):
+                    discounted_reward *= GAMMA
+                    discounted_reward += reward_group[1]
+
+                # mask by done states and add + scale to critic output
+
+            steps += 1
 
         print(f'Ep {ep}: {np.array(ep_rews).mean()}')
 
