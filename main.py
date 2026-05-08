@@ -192,7 +192,56 @@ class ExperienceSourceFL():
 
             yield ExperienceFL(state=mem[0], action=action, reward=discounted_reward, final=last_state)
 
+def distr_proj(next_distr, rewards, dones, gamma):
+    batch_size = len(rewards)
+    proj_distr = np.zeros((batch_size, N_ATOMS), dtype=np.float32)
+    delta_z = (Vmax - Vmin) / (N_ATOMS - 1) # "size" of atom
+    for atom in range(N_ATOMS):
+        # for each atom, add reward and scale by gamma
+        v = rewards + (Vmin + atom * delta_z) * gamma
 
+        # set atom to be between Vmax and Vmin range 
+        rew_clipped = np.minimum(Vmax, np.maximum(Vmin, v))
+        frac_position = (rew_clipped - Vmin) / delta_z
+        lower_neighbor = np.floor(frac_position).astype(np.int64)
+        upper_neighbor = np.ceil(frac_position).astype(np.int64)
+
+        # if fractional position of reward is right on an atom, then simply
+        # add to that atom
+        eq_mask = upper_neighbor == lower_neighbor
+        proj_distr[eq_mask, lower_neighbor[eq_mask]] += next_distr[eq_mask, atom]
+
+        # more likely it will not land directly on an atom
+        # split and spread by weight to each neighbor
+        ne_mask = upper_neighbor != lower_neighbor
+
+        proj_distr[ne_mask, lower_neighbor[ne_mask]] += next_distr[ne_mask, atom] * (upper_neighbor - frac_position)[ne_mask]
+        
+        proj_distr[ne_mask, upper_neighbor[ne_mask]] += next_distr[ne_mask, atom] * (frac_position - lower_neighbor)[ne_mask]
+
+    if dones.any():
+        proj_distr[dones] = 0.0 # set terminal states to 0 across distribution
+        rew_clipped = np.minimum(Vmax, np.maximum(Vmin, rewards[dones]))
+        frac_position = (rew_clipped - Vmin) / delta_z
+        lower_neighbor = np.floor(frac_position).astype(np.int64)
+        upper_neighbor = np.ceil(frac_position).astype(np.int64)
+
+        # if fractional position right on atom
+        eq_mask = lower_neighbor == upper_neighbor
+        eq_dones = dones.copy()
+        eq_dones[dones] = eq_mask
+        if eq_dones.any():
+            proj_distr[eq_dones, lower_neighbor[eq_mask]] = 1.0
+
+        ne_mask = lower_neighbor != upper_neighbor
+        ne_dones = dones.copy()
+        ne_dones[dones] = ne_mask
+        if ne_dones.any():
+            proj_distr[ne_dones, lower_neighbor[ne_mask]] = (upper_neighbor - frac_position)[ne_mask]
+
+            proj_distr[ne_dones, upper_neighbor[ne_mask]] = (frac_position - lower_neighbor)[ne_mask]
+
+    return proj_distr
 
 if __name__ == "__main__":
     GAMMA = 0.99 # reward discounting
