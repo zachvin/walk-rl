@@ -1,12 +1,13 @@
 import torch.nn as nn
 import torch
 from torch import optim
-import torch.functional as F
+import torch.nn.functional as F
 import numpy as np
 import gymnasium as gym
 from collections import deque
 from dataclasses import dataclass
 import random
+import copy
 
 class PPOAgent():
     # has network and device
@@ -20,7 +21,7 @@ class PPOAgent():
 
 
 class D4PGCritic(nn.Module):
-    def __init__(self, obs_size, act_size, n_atoms, v_min, v_max, use_target):
+    def __init__(self, obs_size, act_size, n_atoms, v_min, v_max):
         super(D4PGCritic, self).__init__()
 
         self.obs_net = nn.Sequential(
@@ -38,11 +39,6 @@ class D4PGCritic(nn.Module):
         self.register_buffer("supports", torch.arange(v_min, v_max + delta,
                                                       delta))
         
-        self.use_target = use_target
-        if self.use_target:
-            self.target = D4PGCritic(obs_size, act_size, n_atoms, v_min, v_max, 
-                                     False)
-
     def forward(self, x: torch.Tensor, a: torch.Tensor):
         obs = self.obs_net(x)
         return self.out_net(torch.cat([obs, a], dim=1))
@@ -53,17 +49,6 @@ class D4PGCritic(nn.Module):
         weights = F.softmax(distr, dim=1) * self.supports
         res = weights.sum(dim=1)
         return res.unsqueeze(dim=-1)
-    
-    def sync(self, a):
-        assert self.use_target
-
-        state = self.state_dict()
-        target_state = self.target.state_dict()
-        for k, v in state.items():
-            target_state[k] = target_state[k] * a + (1-a) * v
-
-        self.target.load_state_dict(target_state)
-
     
 class D4PGAgent():
     def __init__(self, actor, device, epsilon):
@@ -86,7 +71,7 @@ class D4PGAgent():
         return actions
     
 class DDPGActor(nn.Module):
-    def __init__(self, obs_size, act_size, use_target):
+    def __init__(self, obs_size, act_size):
         super(DDPGActor, self).__init__()
 
         self.net = nn.Sequential(
@@ -98,12 +83,24 @@ class DDPGActor(nn.Module):
             nn.Tanh() # restrict to [-1, 1]
         )
 
-        self.use_target = use_target
-        if self.use_target:
-            self.target = DDPGActor(obs_size, act_size, False)
-
     def forward(self, x):
         return self.net(x)
+    
+class TargetNetwork(nn.Module):
+    def __init__(self, model):
+        super(TargetNetwork, self).__init__()
+
+        self.model = model
+        # deep copy for target network to separate gradients
+        self.target = copy.deepcopy(model)
+
+    def sync(self, a):
+        state = self.model.state_dict()
+        target_state = self.target.state_dict()
+        for k, v in state.items():
+            target_state[k] = target_state[k] * a + (1-a) * v
+
+        self.target.load_state_dict(target_state)
         
 class D4PGActor(DDPGActor):
     pass
@@ -218,10 +215,10 @@ class ExperienceReplayBuffer():
         return iter(self.buffer)
     
     def sample(self, batch_size):
-        if len(self.buffer <= batch_size):
+        if len(self.buffer) <= batch_size:
             return self.buffer
         
-        idxs = np.random.choice(len(self.buffer), replace=True)
+        idxs = np.random.choice(len(self.buffer), batch_size, replace=True)
         return [self.buffer[idx] for idx in idxs]
     
     def _add(self, sample):
@@ -243,11 +240,11 @@ def unpack_batch(batch, device="cpu"):
         states.append(exp.state)
         actions.append(exp.action)
         rewards.append(exp.reward)
-        dones.append(exp.last_state is None)
-        if exp.last_state is None:
+        dones.append(exp.final is None)
+        if exp.final is None:
             last_states.append(exp.state)
         else:
-            last_states.append(exp.last_state)
+            last_states.append(exp.final)
     states_v = torch.as_tensor(np.array(states, dtype=np.float32)).to(device)
     actions_v = torch.as_tensor(np.array(actions, dtype=np.float32)).to(device)
     rewards_v = torch.as_tensor(np.array(rewards, dtype=np.float32)).to(device)
@@ -311,7 +308,7 @@ GAMMA = 0.99 # reward discounting
 BATCH_SIZE = 64
 LEARNING_RATE = 1e-4
 REPLAY_SIZE = 100000
-REPLAY_INITIAL = 10000
+REPLAY_INITIAL = 100 # 10_000
 REWARD_STEPS = 5
 TEST_ITERS = 1000
 Vmax = 10
@@ -322,12 +319,14 @@ DELTA_Z = (Vmax - Vmin) / (N_ATOMS - 1)
 
 if __name__ == "__main__":
 
-    env = gym.make('Ant-v5', render_mode='human')
+    env = gym.make('Ant-v5')
     critic = D4PGCritic(env.observation_space.shape[0],
-                        env.action_space.shape[0], N_ATOMS, Vmin, Vmax, True)
+                        env.action_space.shape[0], N_ATOMS, Vmin, Vmax)
+    critic_target = TargetNetwork(critic)
     
     actor = D4PGActor(env.observation_space.shape[0],
-                      env.action_space.shape[0], True)
+                      env.action_space.shape[0])
+    actor_target = TargetNetwork(actor)
     
     agent = D4PGAgent(actor, torch.device('cuda' if torch.cuda.is_available() else 'cpu'), EPSILON)
 
@@ -337,7 +336,7 @@ if __name__ == "__main__":
     actor_optimizer = optim.Adam(actor.parameters(), lr=LEARNING_RATE)
     critic_optimizer = optim.Adam(critic.parameters(), lr=LEARNING_RATE)
 
-    device = torch.device('gpu' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     step = 0
     best_rew = None
@@ -360,8 +359,8 @@ if __name__ == "__main__":
         critic_optimizer.zero_grad()
         critic_out = critic(states, actions)
         
-        last_actions = actor.target(last_states)
-        last_distr = F.softmax(critic.target(last_states, last_actions), dim=1)
+        last_actions = actor_target.target(last_states)
+        last_distr = F.softmax(critic_target.target(last_states, last_actions), dim=1)
 
         # target distribution
         proj_distr = distr_proj(last_distr.detach().cpu().numpy(),
@@ -384,13 +383,13 @@ if __name__ == "__main__":
         critic_out = critic(states, actor_actions)
 
         # collapse distribution to one q value
-        actor_loss = -critic.distr_to_q(critic_out)
+        actor_loss = -critic.distr_to_q(critic_out).mean()
         actor_loss.backward()
         actor_optimizer.step()
 
         # update target networks with alpha=1-1e-3
-        actor.sync(1 - 1e-3)
-        critic.sync(1 - 1e-3)
+        actor_target.sync(1 - 1e-3)
+        critic_target.sync(1 - 1e-3)
 
         
     print('Training done.')
