@@ -156,6 +156,7 @@ class ExperienceSource():
 
                 # metrics
                 self.total_rews.append(cur_rews)
+                print(sum(self.total_rews) / len(self.total_rews))
                 self.total_steps.append(cur_steps)
 
                 cur_rews = 0.0
@@ -330,18 +331,21 @@ if __name__ == "__main__":
     
     agent = D4PGAgent(actor, torch.device('cuda' if torch.cuda.is_available() else 'cpu'), EPSILON)
 
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    actor.to(device)
+    critic.to(device)
+    actor_target.to(device)
+    critic_target.to(device)
+
     exp_source = ExperienceSourceFL(env, agent, steps_count=REWARD_STEPS, gamma=GAMMA)
     buffer = ExperienceReplayBuffer(exp_source, buffer_size=REPLAY_SIZE)
 
     actor_optimizer = optim.Adam(actor.parameters(), lr=LEARNING_RATE)
     critic_optimizer = optim.Adam(critic.parameters(), lr=LEARNING_RATE)
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
     step = 0
     best_rew = None
     while True:
-        print(f'Step {step}')
         step += 1
         buffer.populate(1)
 
@@ -352,8 +356,6 @@ if __name__ == "__main__":
         batch = buffer.sample(BATCH_SIZE)
 
         states, actions, rews, dones, last_states = unpack_batch(batch, device)
-
-        print(rews)
 
         # critic > add discounted critic output for last state
         critic_optimizer.zero_grad()
@@ -391,6 +393,14 @@ if __name__ == "__main__":
         actor_target.sync(1 - 1e-3)
         critic_target.sync(1 - 1e-3)
 
-        
+        if step % TEST_ITERS == 0:
+            print(f'Current rewards [{step//1000}]: {sum(exp_source.total_rews[:-1000]) / 1000}')
+
+        if step % (TEST_ITERS * 10) == 0:
+            print('Saving...')
+            torch.save(actor.state_dict(), f'actor_{step}.pt')
+            torch.save(critic.state_dict(), f'critic_{step}.pt')
+
+
     print('Training done.')
     env.close()
